@@ -23,6 +23,7 @@ from server.nevina_client import (
     GEN_PARAMS_URL,
     NEDBFELT_LAYER_URL,
     NevinaClient,
+    NevinaInternalError,
     NevinaJobFailed,
     NevinaJobTimeout,
     NevinaNoFeature,
@@ -82,7 +83,12 @@ async def test_delineate_runs_full_three_step_pipeline() -> None:
     transport = _make_handler([
         # Step 1: GenNedborFelt submitJob → succeeded
         ("GenNedborFelt/submitJob", {"jobId": "job1"}),
-        ("GenNedborFelt/jobs/job1", {"jobStatus": "esriJobSucceeded"}),
+        ("GenNedborFelt/jobs/job1", {
+            "jobStatus": "esriJobSucceeded",
+            "messages": [
+                {"type": "esriJobMessageTypeInformative", "description": "Avstand til elvenettet = 12.5"},
+            ],
+        }),
         ("GenNedborFelt/jobs/job1/results/GUID", {"value": SAMPLE_GUID}),
         # Step 2: GenNedborFeltParams submitJob → succeeded
         ("GenNedborFeltParams/submitJob", {"jobId": "job2"}),
@@ -111,6 +117,27 @@ async def test_delineate_runs_full_three_step_pipeline() -> None:
     assert result.area_km2 == SAMPLE_AREA_KM2
     assert result.parameters["elvenavn"] == "Testelva"
     assert result.polygon is None
+    assert result.snap_distance_m == 12.5
+
+
+@pytest.mark.asyncio
+async def test_delineate_handles_missing_snap_distance_gracefully() -> None:
+    transport = _make_handler([
+        ("GenNedborFelt/submitJob", {"jobId": "j1"}),
+        ("GenNedborFelt/jobs/j1", {"jobStatus": "esriJobSucceeded"}),
+        ("GenNedborFelt/jobs/j1/results/GUID", {"value": SAMPLE_GUID}),
+        ("GenNedborFeltParams/submitJob", {"jobId": "j2"}),
+        ("GenNedborFeltParams/jobs/j2", {"jobStatus": "esriJobSucceeded"}),
+        ("MapServer/4/query", {"features": [{"attributes": {"areal_km2": 1.0}}]}),
+    ])
+    client = _client_with(transport)
+
+    try:
+        result = await client.delineate(lng_wgs84=10.21, lat_wgs84=63.42)
+    finally:
+        await client.aclose()
+
+    assert result.snap_distance_m is None
 
 
 @pytest.mark.asyncio
@@ -242,6 +269,35 @@ async def test_job_timeout_raises_nevina_job_timeout() -> None:
         await client.aclose()
 
     assert pending_count[0] >= 1
+
+
+@pytest.mark.asyncio
+async def test_internal_crash_raises_internal_error_not_generic_job_failed() -> None:
+    """NEVINA's GenNedborFeltParams can crash mid-way (e.g., gradient
+    div-by-zero on micro-catchments). Should surface as the dedicated
+    NevinaInternalError so callers can tell it apart from off-network /
+    bad-GUID failures and skip retrying with a different point."""
+    transport = _make_handler([
+        ("GenNedborFelt/submitJob", {"jobId": "j1"}),
+        ("GenNedborFelt/jobs/j1", {"jobStatus": "esriJobSucceeded"}),
+        ("GenNedborFelt/jobs/j1/results/GUID", {"value": SAMPLE_GUID}),
+        ("GenNedborFeltParams/submitJob", {"jobId": "j2"}),
+        ("GenNedborFeltParams/jobs/j2", {
+            "jobStatus": "esriJobFailed",
+            "messages": [
+                {"type": "esriJobMessageTypeError", "description": "PYTHON ERROR:\nFile \"gradient.py\", line 113, in gradient"},
+                {"type": "esriJobMessageTypeInformative", "description": "Failed script GenNedborFeltParams..."},
+                {"type": "esriJobMessageTypeError", "description": "Failed to execute (GenNedborFeltParams)."},
+            ],
+        }),
+    ])
+    client = _client_with(transport)
+
+    try:
+        with pytest.raises(NevinaInternalError, match="gradient"):
+            await client.delineate(lng_wgs84=10.21, lat_wgs84=63.42)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

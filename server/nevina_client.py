@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +89,15 @@ DEFAULT_JOB_TIMEOUT_S = 360.0
 # get a useful exception instead of the cryptic step-2 failure.
 _OFF_NETWORK_MARKER = "for langt fra elvenettet"
 
+# NEVINA logs the snap distance in step 1 with this line:
+#   "Avstand til elvenettet = 89.28647433936263"
+# Capturing it lets callers tell whether engine-vs-NEVINA comparisons are
+# clean (both systems looked at the same river segment) or noisy (NEVINA
+# snapped tens of metres further than the engine did).
+_SNAP_DISTANCE_RE = re.compile(
+    r"Avstand til elvenettet\s*=\s*([0-9]+(?:\.[0-9]+)?)"
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Result type
@@ -101,6 +111,11 @@ class CatchmentResult:
     area_km2: float
     parameters: dict[str, Any]
     polygon: dict[str, Any] | None = None  # GeoJSON polygon if requested
+    # How far NEVINA had to move the user-supplied point to reach a river
+    # segment. Surfaced because callers comparing engine vs NEVINA areas
+    # need to know whether the two systems even agree on which river the
+    # intake is on. >50 m usually means the comparison is noisy.
+    snap_distance_m: float | None = None
 
     @property
     def has_polygon(self) -> bool:
@@ -134,6 +149,26 @@ class NevinaPointNotOnRiver(NevinaError):
     service to delineate a catchment. Move the point onto an actual river
     segment (within ~90 m) and retry. Often happens when a user clicks on
     a fjord, lake or land far from the nearest stream."""
+
+
+class NevinaInternalError(NevinaError):
+    """NEVINA's GenNedborFeltParams script crashed mid-way through computing
+    a parameter. Most common cause observed in production: micro-catchments
+    smaller than ~0.1 km² that trigger division-by-zero in NEVINA's
+    gradient.py (``(hohTopp - hohPkt) / (elvLengd / 1000)``) when the
+    upstream stream length is zero. The point is on the network and a
+    catchment was delineated, but the parameter pass failed and Layer 4
+    will not be populated for this GUID."""
+
+
+# Substring NEVINA logs in the GP-job messages when its own parameter
+# computation crashes (most commonly the gradient division-by-zero). We
+# pattern-match generously since the exact wording can vary by which
+# parameter step failed.
+_INTERNAL_ERROR_MARKERS = (
+    "Failed script GenNedborFeltParams",
+    "Failed to execute (GenNedborFeltParams)",
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -186,7 +221,7 @@ class NevinaClient:
         )
         logger.info("NEVINA delineate at UTM33 (%.2f, %.2f)", x, y)
 
-        guid = await self._gen_nedborfelt(x, y)
+        guid, snap_distance_m = await self._gen_nedborfelt(x, y)
         await self._gen_nedborfelt_params(guid)
         feature = await self._query_feature(guid, include_polygon=include_polygon)
 
@@ -201,6 +236,7 @@ class NevinaClient:
             area_km2=area_km2,
             parameters=attributes,
             polygon=polygon,
+            snap_distance_m=snap_distance_m,
         )
 
     # ── coordinate handling ───────────────────────────────────────
@@ -224,8 +260,10 @@ class NevinaClient:
 
     # ── GenNedborFelt ─────────────────────────────────────────────
 
-    async def _gen_nedborfelt(self, x_utm33: float, y_utm33: float) -> str:
-        """Step 1: submit point to GenNedborFelt; return the generated GUID.
+    async def _gen_nedborfelt(
+        self, x_utm33: float, y_utm33: float
+    ) -> tuple[str, float | None]:
+        """Step 1: submit point to GenNedborFelt; return (GUID, snap_distance_m).
 
         Step 1 is misleadingly cheerful: it can finish with status
         ``esriJobSucceeded`` while logging "Punktet er for langt fra
@@ -233,6 +271,11 @@ class NevinaClient:
         and step 2 will fail. We scan the job messages and raise a clear
         :class:`NevinaPointNotOnRiver` before the user wastes time
         polling step 2.
+
+        We also harvest the "Avstand til elvenettet = X" line from the
+        job log so callers can judge whether the engine and NEVINA are
+        comparing the same physical intake or two close-but-different
+        river segments.
         """
         utlopspunkt = self._build_point_recordset(x_utm33, y_utm33)
         params = {
@@ -243,12 +286,13 @@ class NevinaClient:
         job_id = await self._submit_job(GEN_NEDBORFELT_URL, params)
         job_data = await self._poll_job(GEN_NEDBORFELT_URL, job_id)
         self._check_off_network(job_data, x_utm33, y_utm33)
+        snap_distance_m = self._extract_snap_distance(job_data)
         guid_value = await self._fetch_result(
             GEN_NEDBORFELT_URL, job_id, output_param="GUID"
         )
         if not guid_value or not isinstance(guid_value, str):
             raise NevinaError(f"GenNedborFelt returned no GUID: {guid_value!r}")
-        return guid_value
+        return guid_value, snap_distance_m
 
     @staticmethod
     def _check_off_network(
@@ -261,6 +305,14 @@ class NevinaClient:
                     f"NEVINA's river network. Move it onto an actual "
                     f"river segment (typically within ~90 m) and retry."
                 )
+
+    @staticmethod
+    def _extract_snap_distance(job_data: dict[str, Any]) -> float | None:
+        for msg in job_data.get("messages") or ():
+            match = _SNAP_DISTANCE_RE.search(msg.get("description") or "")
+            if match:
+                return float(match.group(1))
+        return None
 
     @staticmethod
     def _build_point_recordset(x: float, y: float) -> dict[str, Any]:
@@ -339,7 +391,15 @@ class NevinaClient:
         return job_id
 
     async def _poll_job(self, base_url: str, job_id: str) -> dict[str, Any]:
-        """Poll until ``esriJobSucceeded``; raise on failure or timeout."""
+        """Poll until ``esriJobSucceeded``; raise on failure or timeout.
+
+        Failure path: NEVINA distinguishes "real failure" (off-network,
+        bad GUID) from "internal crash" (gradient div-by-zero etc.) only
+        in the job messages, not in the status. Both arrive as
+        ``esriJobFailed``. We separate them so callers can tell the
+        difference between user-correctable errors and NEVINA bugs we
+        just have to log around.
+        """
         url = f"{base_url}/jobs/{job_id}"
         deadline = asyncio.get_event_loop().time() + self._job_timeout_s
         while True:
@@ -350,9 +410,17 @@ class NevinaClient:
             if status == "esriJobSucceeded":
                 return data
             if status in ("esriJobFailed", "esriJobCancelled", "esriJobTimedOut"):
+                if self._is_internal_crash(data):
+                    raise NevinaInternalError(
+                        f"NEVINA's GenNedborFeltParams crashed for job "
+                        f"{job_id}. Common cause: catchment < 0.1 km² "
+                        f"triggers div-by-zero in NEVINA's gradient.py. "
+                        f"Last messages: "
+                        f"{self._tail_descriptions(data, n=5)}"
+                    )
                 raise NevinaJobFailed(
-                    f"GP job {job_id} ended with status {status!r}: "
-                    f"{data.get('messages')!r}"
+                    f"GP job {job_id} ended with status {status!r}. "
+                    f"Last messages: {self._tail_descriptions(data, n=5)}"
                 )
             if asyncio.get_event_loop().time() > deadline:
                 raise NevinaJobTimeout(
@@ -360,6 +428,20 @@ class NevinaClient:
                     f"{self._job_timeout_s:.0f} s (last status: {status!r})."
                 )
             await asyncio.sleep(self._poll_interval_s)
+
+    @staticmethod
+    def _is_internal_crash(job_data: dict[str, Any]) -> bool:
+        joined = " ".join(
+            msg.get("description") or "" for msg in job_data.get("messages") or ()
+        )
+        return any(marker in joined for marker in _INTERNAL_ERROR_MARKERS)
+
+    @staticmethod
+    def _tail_descriptions(job_data: dict[str, Any], *, n: int) -> str:
+        msgs = job_data.get("messages") or []
+        return " | ".join(
+            (m.get("description") or "")[:200] for m in msgs[-n:]
+        )
 
     async def _fetch_result(
         self, base_url: str, job_id: str, *, output_param: str

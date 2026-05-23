@@ -36,6 +36,13 @@ from .nevina_client import CatchmentResult, NevinaClient
 VERDICT_AGREE_PCT = 5.0
 VERDICT_MINOR_PCT = 20.0
 
+# NEVINA snaps the user-supplied point to the nearest river segment.
+# Distances beyond this threshold mean the comparison is noisy — the
+# engine may have snapped to a different segment, so an "agree" or
+# "drift" verdict here says less about model accuracy than about
+# coordinate precision.
+SNAP_SUSPECT_THRESHOLD_M = 50.0
+
 
 def _verdict_for_drift(drift_pct: float) -> str:
     abs_drift = abs(drift_pct)
@@ -164,6 +171,11 @@ async def compare_tool(
     drift_pct = (engine_area_km2 - nevina_km2) / nevina_km2 * 100.0
     verdict = _verdict_for_drift(drift_pct)
 
+    snap_suspect = (
+        result.snap_distance_m is not None
+        and result.snap_distance_m > SNAP_SUSPECT_THRESHOLD_M
+    )
+
     return {
         "guid": result.guid,
         "nevina_km2": nevina_km2,
@@ -175,6 +187,9 @@ async def compare_tool(
             "agree": VERDICT_AGREE_PCT,
             "minor": VERDICT_MINOR_PCT,
         },
+        "snap_distance_m": result.snap_distance_m,
+        "snap_suspect": snap_suspect,
+        "snap_suspect_threshold_m": SNAP_SUSPECT_THRESHOLD_M,
         "polygon": result.polygon if include_polygon else None,
         # Pass through a few headline NEVINA fields for context — the
         # full parameter set is available via nevina_delineate when needed.
@@ -192,6 +207,7 @@ def _result_to_dict(
     out: dict[str, Any] = {
         "guid": result.guid,
         "area_km2": result.area_km2,
+        "snap_distance_m": result.snap_distance_m,
         "parameters": result.parameters,
     }
     if include_polygon:

@@ -46,7 +46,12 @@ def test_thresholds_are_ordered() -> None:
 class _FakeClient:
     """Minimal stand-in for NevinaClient — returns a canned result."""
 
-    def __init__(self, area_km2: float, parameters: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        area_km2: float,
+        parameters: dict[str, Any] | None = None,
+        snap_distance_m: float | None = 5.0,
+    ) -> None:
         self._result = CatchmentResult(
             guid="fake-guid",
             area_km2=area_km2,
@@ -57,6 +62,7 @@ class _FakeClient:
                 "fylkeNavn": "Trøndelag",
             },
             polygon=None,
+            snap_distance_m=snap_distance_m,
         )
 
     async def delineate(self, **_kwargs: Any) -> CatchmentResult:
@@ -115,6 +121,29 @@ async def test_compare_tool_flags_major_drift_for_g1_style_blowup() -> None:
     )
     assert out["verdict"] == "drift_major"
     assert out["drift_pct"] == pytest.approx(1300.0)
+
+
+@pytest.mark.asyncio
+async def test_compare_tool_marks_snap_suspect_when_snap_is_far() -> None:
+    client = _FakeClient(area_km2=10.0, snap_distance_m=120.0)
+    out = await compare_tool(
+        client,  # type: ignore[arg-type]
+        lng_wgs84=10.21, lat_wgs84=63.42,
+        engine_area_km2=10.5,
+    )
+    assert out["snap_distance_m"] == 120.0
+    assert out["snap_suspect"] is True
+
+
+@pytest.mark.asyncio
+async def test_compare_tool_does_not_flag_suspect_when_snap_is_close() -> None:
+    client = _FakeClient(area_km2=10.0, snap_distance_m=8.0)
+    out = await compare_tool(
+        client,  # type: ignore[arg-type]
+        lng_wgs84=10.21, lat_wgs84=63.42,
+        engine_area_km2=10.5,
+    )
+    assert out["snap_suspect"] is False
 
 
 @pytest.mark.asyncio
