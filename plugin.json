@@ -1,0 +1,16 @@
+{
+  "name": "nevina-mcp",
+  "version": "0.1.0",
+  "description": "NEVINA4 hydrology delineation MCP — query NVE's authoritative catchment service from inside Claude Code. Enables ground-truth validation of engine-computed drainage areas against NVE's NEVINA service.",
+  "author": "Vetle Lehland",
+  "homepage": "https://nevina.nve.no/",
+  "mcpServers": {
+    "nevina": {
+      "command": "python",
+      "args": ["-m", "server.server"],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
